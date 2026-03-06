@@ -3167,3 +3167,432 @@ describe("getOngoingBookingForAsset", () => {
     expect(result).toEqual(checkedOutBooking);
   });
 });
+
+// Integration Tests for Kit Hierarchy Booking Logic
+describe("Booking with Kit Hierarchy", () => {
+  let org: any;
+  let user: any;
+  let parentKit: any;
+  let childKit: any;
+  let grandchildKit: any;
+  let parentAsset: any;
+  let childAsset: any;
+  let grandchildAsset: any;
+
+  beforeEach(async () => {
+    // Create test organization
+    org = await db.organization.create({
+      data: {
+        name: "Test Org",
+        clerkUserId: "test-user",
+      },
+    });
+
+    // Create test user
+    user = await db.user.create({
+      data: {
+        email: "test@example.com",
+        firstName: "Test",
+        lastName: "User",
+        clerkId: "clerk-test",
+      },
+    });
+
+    // Create user organization
+    await db.userOrganization.create({
+      data: {
+        userId: user.id,
+        organizationId: org.id,
+        role: OrganizationRoles.ADMIN,
+      },
+    });
+
+    // Create kit hierarchy: parent -> child -> grandchild
+    parentKit = await db.kit.create({
+      data: {
+        name: "Parent Kit",
+        organizationId: org.id,
+        status: KitStatus.AVAILABLE,
+      },
+    });
+
+    childKit = await db.kit.create({
+      data: {
+        name: "Child Kit",
+        organizationId: org.id,
+        status: KitStatus.AVAILABLE,
+        parentKitId: parentKit.id,
+      },
+    });
+
+    grandchildKit = await db.kit.create({
+      data: {
+        name: "Grandchild Kit",
+        organizationId: org.id,
+        status: KitStatus.AVAILABLE,
+        parentKitId: childKit.id,
+      },
+    });
+
+    // Create assets for each kit
+    parentAsset = await db.asset.create({
+      data: {
+        title: "Parent Asset",
+        organizationId: org.id,
+        kitId: parentKit.id,
+        status: AssetStatus.AVAILABLE,
+      },
+    });
+
+    childAsset = await db.asset.create({
+      data: {
+        title: "Child Asset",
+        organizationId: org.id,
+        kitId: childKit.id,
+        status: AssetStatus.AVAILABLE,
+      },
+    });
+
+    grandchildAsset = await db.asset.create({
+      data: {
+        title: "Grandchild Asset",
+        organizationId: org.id,
+        kitId: grandchildKit.id,
+        status: AssetStatus.AVAILABLE,
+      },
+    });
+  });
+
+  afterEach(async () => {
+    // Clean up in reverse order due to foreign key constraints
+    await db.asset.deleteMany({
+      where: { organizationId: org.id },
+    });
+    await db.kit.deleteMany({
+      where: { organizationId: org.id },
+    });
+    await db.booking.deleteMany({
+      where: { organizationId: org.id },
+    });
+    await db.userOrganization.deleteMany({
+      where: { organizationId: org.id },
+    });
+    await db.organization.delete({
+      where: { id: org.id },
+    });
+    await db.user.delete({
+      where: { id: user.id },
+    });
+  });
+
+  it("prevents booking parent when child is already booked", async () => {
+    // Book child kit first
+    const childBooking = await createBooking({
+      booking: {
+        name: "Child Booking",
+        description: "Booking child kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [childAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(childBooking).toBeDefined();
+    expect(childBooking.status).toBe(BookingStatus.DRAFT);
+
+    // Try to book parent kit (should fail)
+    await expect(
+      createBooking({
+        booking: {
+          name: "Parent Booking",
+          description: "Booking parent kit",
+          creatorId: user.id,
+          custodianUserId: user.id,
+          custodianTeamMemberId: user.id,
+          organizationId: org.id,
+          from: new Date("2026-03-12"),
+          to: new Date("2026-03-18"),
+          tags: [],
+        },
+        assetIds: [parentAsset.id],
+        hints: { timezone: "UTC" },
+      })
+    ).rejects.toThrow("Child Kit is unavailable");
+  });
+
+  it("prevents booking child when parent is already booked", async () => {
+    // Book parent kit first
+    const parentBooking = await createBooking({
+      booking: {
+        name: "Parent Booking",
+        description: "Booking parent kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [parentAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(parentBooking).toBeDefined();
+    expect(parentBooking.status).toBe(BookingStatus.DRAFT);
+
+    // Try to book child kit (should fail)
+    await expect(
+      createBooking({
+        booking: {
+          name: "Child Booking",
+          description: "Booking child kit",
+          creatorId: user.id,
+          custodianUserId: user.id,
+          custodianTeamMemberId: user.id,
+          organizationId: org.id,
+          from: new Date("2026-03-12"),
+          to: new Date("2026-03-18"),
+          tags: [],
+        },
+        assetIds: [childAsset.id],
+        hints: { timezone: "UTC" },
+      })
+    ).rejects.toThrow("Parent Kit is unavailable");
+  });
+
+  it("prevents booking grandchild when ancestor is booked", async () => {
+    // Book parent kit
+    await createBooking({
+      booking: {
+        name: "Parent Booking",
+        description: "Booking parent kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [parentAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    // Try to book grandchild kit (should fail)
+    await expect(
+      createBooking({
+        booking: {
+          name: "Grandchild Booking",
+          description: "Booking grandchild kit",
+          creatorId: user.id,
+          custodianUserId: user.id,
+          custodianTeamMemberId: user.id,
+          organizationId: org.id,
+          from: new Date("2026-03-12"),
+          to: new Date("2026-03-14"),
+          tags: [],
+        },
+        assetIds: [grandchildAsset.id],
+        hints: { timezone: "UTC" },
+      })
+    ).rejects.toThrow("Parent Kit is unavailable");
+  });
+
+  it("prevents booking ancestor when descendant is booked", async () => {
+    // Book grandchild kit
+    await createBooking({
+      booking: {
+        name: "Grandchild Booking",
+        description: "Booking grandchild kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [grandchildAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    // Try to book parent kit (should fail)
+    await expect(
+      createBooking({
+        booking: {
+          name: "Parent Booking",
+          description: "Booking parent kit",
+          creatorId: user.id,
+          custodianUserId: user.id,
+          custodianTeamMemberId: user.id,
+          organizationId: org.id,
+          from: new Date("2026-03-12"),
+          to: new Date("2026-03-14"),
+          tags: [],
+        },
+        assetIds: [parentAsset.id],
+        hints: { timezone: "UTC" },
+      })
+    ).rejects.toThrow("Grandchild Kit is unavailable");
+  });
+
+  it("allows booking unrelated kits with overlapping dates", async () => {
+    // Create another unrelated kit and asset
+    const unrelatedKit = await db.kit.create({
+      data: {
+        name: "Unrelated Kit",
+        organizationId: org.id,
+        status: KitStatus.AVAILABLE,
+      },
+    });
+
+    const unrelatedAsset = await db.asset.create({
+      data: {
+        title: "Unrelated Asset",
+        organizationId: org.id,
+        kitId: unrelatedKit.id,
+        status: AssetStatus.AVAILABLE,
+      },
+    });
+
+    // Book parent kit
+    const parentBooking = await createBooking({
+      booking: {
+        name: "Parent Booking",
+        description: "Booking parent kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [parentAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(parentBooking).toBeDefined();
+
+    // Should be able to book unrelated kit
+    const unrelatedBooking = await createBooking({
+      booking: {
+        name: "Unrelated Booking",
+        description: "Booking unrelated kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-12"),
+        to: new Date("2026-03-14"),
+        tags: [],
+      },
+      assetIds: [unrelatedAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(unrelatedBooking).toBeDefined();
+    expect(unrelatedBooking.status).toBe(BookingStatus.DRAFT);
+
+    // Clean up unrelated kit
+    await db.asset.delete({ where: { id: unrelatedAsset.id } });
+    await db.kit.delete({ where: { id: unrelatedKit.id } });
+  });
+
+  it("allows booking related kits with non-overlapping dates", async () => {
+    // Book parent kit
+    const parentBooking = await createBooking({
+      booking: {
+        name: "Parent Booking",
+        description: "Booking parent kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [parentAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(parentBooking).toBeDefined();
+
+    // Should be able to book child kit with non-overlapping dates
+    const childBooking = await createBooking({
+      booking: {
+        name: "Child Booking",
+        description: "Booking child kit",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-16"),
+        to: new Date("2026-03-20"),
+        tags: [],
+      },
+      assetIds: [childAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(childBooking).toBeDefined();
+    expect(childBooking.status).toBe(BookingStatus.DRAFT);
+  });
+
+  it("prevents adding conflicting assets to existing booking", async () => {
+    // Create initial booking with parent asset
+    const initialBooking = await createBooking({
+      booking: {
+        name: "Initial Booking",
+        description: "Initial booking",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-10"),
+        to: new Date("2026-03-15"),
+        tags: [],
+      },
+      assetIds: [parentAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    expect(initialBooking).toBeDefined();
+
+    // Create another booking with child asset
+    await createBooking({
+      booking: {
+        name: "Child Booking",
+        description: "Child booking",
+        creatorId: user.id,
+        custodianUserId: user.id,
+        custodianTeamMemberId: user.id,
+        organizationId: org.id,
+        from: new Date("2026-03-12"),
+        to: new Date("2026-03-14"),
+        tags: [],
+      },
+      assetIds: [childAsset.id],
+      hints: { timezone: "UTC" },
+    });
+
+    // Try to add child asset to initial booking (should fail)
+    await expect(
+      updateBookingAssets({
+        id: initialBooking.id,
+        organizationId: org.id,
+        assetIds: [parentAsset.id, childAsset.id],
+        kitIds: [parentKit.id, childKit.id],
+        userId: user.id,
+      })
+    ).rejects.toThrow("Cannot add assets");
+  });
+});

@@ -97,6 +97,7 @@ import {
 import { createSystemBookingNote } from "../booking-note/service.server";
 import { createNotes } from "../note/service.server";
 import { getOrganizationAdminsEmails } from "../organization/service.server";
+import { getKitAncestors, getKitDescendants } from "../kit/hierarchy.server";
 import { TAG_WITH_COLOR_SELECT } from "../tag/constants";
 import { getUserByID } from "../user/service.server";
 
@@ -337,8 +338,65 @@ export async function createBooking({
   hints: ClientHint;
 }) {
   try {
-    const dataToCreate: Prisma.BookingCreateInput = {
-      name: booking.name,
+    // Create booking with transaction safety and hierarchy validation
+    return await db.$transaction(async (tx) => {
+      // NEW: Validate kit hierarchy availability before creating booking
+      if (assetIds.length > 0) {
+        // Get all unique kit IDs from assets with lock
+        const assetsWithKits = await tx.asset.findMany({
+          where: { id: { in: assetIds } },
+          select: { id: true, kitId: true },
+        });
+        
+        const kitIds = assetsWithKits
+          .map(a => a.kitId)
+          .filter((id): id is string => id !== null);
+        
+        if (kitIds.length > 0) {
+          // Lock all related kits to prevent race conditions
+          const [ancestors, descendants] = await Promise.all([
+            // Get all ancestors for all kits
+            Promise.all(kitIds.map(kitId => getKitAncestors(kitId, booking.organizationId))).then(results => 
+              results.flat()
+            ),
+            // Get all descendants for all kits  
+            Promise.all(kitIds.map(kitId => getKitDescendants(kitId, booking.organizationId))).then(results =>
+              results.flat()
+            ),
+          ]);
+          
+          const allRelatedKitIds = [
+            ...kitIds,
+            ...ancestors.map(a => a.id),
+            ...descendants.map(d => d.id),
+          ];
+          
+          // Lock the kits using SELECT FOR UPDATE
+          await tx.kit.updateMany({
+            where: { id: { in: allRelatedKitIds } },
+            data: { updatedAt: new Date() }, // Dummy update to acquire lock
+          });
+          
+          const hierarchyValidation = await validateKitHierarchyAvailability(
+            kitIds,
+            booking.from,
+            booking.to,
+            booking.organizationId
+          );
+          
+          if (!hierarchyValidation.valid) {
+            throw new ShelfError({
+              cause: null,
+              message: `Booking conflicts detected:\n${hierarchyValidation.conflicts.join("\n")}`,
+              label: "Booking",
+              status: 409, // Conflict
+            });
+          }
+        }
+      }
+
+      const dataToCreate: Prisma.BookingCreateInput = {
+        name: booking.name,
       from: booking.from,
       to: booking.to,
       description: booking.description,
@@ -357,35 +415,36 @@ export async function createBooking({
       custodianTeamMember: {
         connect: { id: booking.custodianTeamMemberId },
       },
-    };
-
-    /**
-     * If assetsIds are passed, we directly connect them.
-     * This can happen when:
-     * - Booking is created from assets bulk actions
-     * - Booking is created from asset page
-     * */
-    if (assetIds.length > 0) {
-      dataToCreate.assets = {
-        connect: assetIds.map((id) => ({ id })),
       };
-    }
 
-    if (booking.custodianUserId) {
-      dataToCreate.custodianUser = {
-        connect: { id: booking.custodianUserId },
-      };
-    }
+      /**
+       * If assetsIds are passed, we directly connect them.
+       * This can happen when:
+       * - Booking is created from assets bulk actions
+       * - Booking is created from asset page
+       * */
+      if (assetIds.length > 0) {
+        dataToCreate.assets = {
+          connect: assetIds.map((id) => ({ id })),
+        };
+      }
 
-    if (booking.tags.length > 0) {
-      dataToCreate.tags = {
-        connect: booking.tags,
-      };
-    }
+      if (booking.custodianUserId) {
+        dataToCreate.custodianUser = {
+          connect: { id: booking.custodianUserId },
+        };
+      }
 
-    return await db.booking.create({
-      data: dataToCreate,
-      include: { ...BOOKING_COMMON_INCLUDE, organization: true },
+      if (booking.tags.length > 0) {
+        dataToCreate.tags = {
+          connect: booking.tags,
+        };
+      }
+
+      return await tx.booking.create({
+        data: dataToCreate,
+        include: { ...BOOKING_COMMON_INCLUDE, organization: true },
+      });
     });
   } catch (cause) {
     throw new ShelfError({
@@ -397,6 +456,75 @@ export async function createBooking({
       label,
     });
   }
+}
+
+/**
+ * Validate that all kits in hierarchy are available for booking
+ */
+export async function validateKitHierarchyAvailability(
+  kitIds: string[],
+  bookingFrom: Date,
+  bookingTo: Date,
+  organizationId: string,
+  excludeBookingId?: string // For updates
+): Promise<{ valid: boolean; conflicts: string[] }> {
+  const conflicts: string[] = [];
+  
+  for (const kitId of kitIds) {
+    // Get all ancestors and descendants
+    const [ancestors, descendants] = await Promise.all([
+      getKitAncestors(kitId, organizationId),
+      getKitDescendants(kitId, organizationId),
+    ]);
+    
+    const relatedKitIds = [
+      kitId,
+      ...ancestors.map(a => a.id),
+      ...descendants.map(d => d.id),
+    ];
+    
+    // Check for conflicting bookings on any related kit
+    const conflictingBookings = await db.booking.findMany({
+      where: {
+        id: excludeBookingId ? { not: excludeBookingId } : undefined,
+        organizationId,
+        status: { in: [BookingStatus.RESERVED, BookingStatus.ONGOING, BookingStatus.OVERDUE] },
+        assets: {
+          some: {
+            kitId: { in: relatedKitIds },
+          },
+        },
+        OR: [
+          { from: { lte: bookingTo }, to: { gte: bookingFrom } },
+          { from: { gte: bookingFrom }, to: { lte: bookingTo } },
+        ],
+      },
+      include: {
+        assets: {
+          include: {
+            kit: true,
+          },
+        },
+      },
+    });
+    
+    if (conflictingBookings.length > 0) {
+      for (const booking of conflictingBookings) {
+        const conflictedKit = booking.assets.find(a => 
+          relatedKitIds.includes(a.kitId || "")
+        )?.kit;
+        
+        conflicts.push(
+          `Kit "${conflictedKit?.name}" is unavailable (Booking #${booking.id} from ${booking.from.toLocaleDateString()} to ${booking.to.toLocaleDateString()})`
+        );
+      }
+    }
+  }
+  
+  return {
+    valid: conflicts.length === 0,
+    conflicts,
+  };
 }
 
 /**
@@ -2016,8 +2144,64 @@ export async function updateBookingAssets({
           id: true,
           name: true,
           status: true,
+          from: true,
+          to: true,
         },
       });
+
+      // NEW: Validate kit hierarchy availability before updating assets
+      if (assetIds.length > 0) {
+        // Get all unique kit IDs from assets with lock
+        const assetsWithKits = await tx.asset.findMany({
+          where: { id: { in: assetIds } },
+          select: { id: true, kitId: true },
+        });
+        
+        const uniqueKitIds = assetsWithKits
+          .map(a => a.kitId)
+          .filter((id): id is string => id !== null);
+        
+        if (uniqueKitIds.length > 0) {
+          // Get all ancestors and descendants for all kits
+          const [ancestors, descendants] = await Promise.all([
+            Promise.all(uniqueKitIds.map(kitId => getKitAncestors(kitId, organizationId))).then(results => 
+              results.flat()
+            ),
+            Promise.all(uniqueKitIds.map(kitId => getKitDescendants(kitId, organizationId))).then(results =>
+              results.flat()
+            ),
+          ]);
+          
+          const allRelatedKitIds = [
+            ...uniqueKitIds,
+            ...ancestors.map(a => a.id),
+            ...descendants.map(d => d.id),
+          ];
+          
+          // Lock the kits using SELECT FOR UPDATE
+          await tx.kit.updateMany({
+            where: { id: { in: allRelatedKitIds } },
+            data: { updatedAt: new Date() }, // Dummy update to acquire lock
+          });
+          
+          const hierarchyValidation = await validateKitHierarchyAvailability(
+            uniqueKitIds,
+            b.from,
+            b.to,
+            organizationId,
+            id // Exclude current booking from validation
+          );
+          
+          if (!hierarchyValidation.valid) {
+            throw new ShelfError({
+              cause: null,
+              message: `Cannot add assets: ${hierarchyValidation.conflicts.join("\n")}`,
+              label: "Booking",
+              status: 409, // Conflict
+            });
+          }
+        }
+      }
 
       // Dedupe assetIds so duplicate entries don't cause false validation failures
       // (findMany returns unique rows, so duplicates would inflate the expected count)

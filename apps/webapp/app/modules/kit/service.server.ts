@@ -27,6 +27,7 @@ import {
   validateBarcodeUniqueness,
 } from "~/modules/barcode/service.server";
 import { ASSET_MAX_IMAGE_UPLOAD_SIZE } from "~/utils/constants";
+import { getKitAncestors, getKitDescendants } from "./hierarchy.server";
 import { updateCookieWithPerPage } from "~/utils/cookies.server";
 import { dateTimeInUnix } from "~/utils/date-time-in-unix";
 import type { ErrorLabel } from "~/utils/error";
@@ -498,6 +499,17 @@ export async function getPaginatedAndFilterableKits<
         // @ts-ignore
         (kit) => Array.isArray(kit.assets) && kit?.assets?.length > 0
       );
+      
+      // Additional filtering for hierarchy conflicts
+      if (bookingFrom && bookingTo) {
+        kits = await filterKitsWithHierarchyConflicts(
+          kits,
+          new Date(bookingFrom),
+          new Date(bookingTo),
+          organizationId,
+          currentBookingId
+        );
+      }
     }
 
     const totalPages = Math.ceil(totalKits / perPage);
@@ -520,6 +532,60 @@ export async function getPaginatedAndFilterableKits<
       label,
     });
   }
+}
+
+/**
+ * Filter out kits whose ancestors or descendants have conflicting bookings
+ * This prevents booking a parent kit when a child is booked, or vice versa
+ */
+async function filterKitsWithHierarchyConflicts(
+  kits: any[],
+  bookingFrom: Date,
+  bookingTo: Date,
+  organizationId: string,
+  currentBookingId?: string
+): Promise<any[]> {
+  const filteredKits: any[] = [];
+  
+  for (const kit of kits) {
+    // Get all ancestors and descendants of this kit
+    const [ancestors, descendants] = await Promise.all([
+      getKitAncestors(kit.id, organizationId),
+      getKitDescendants(kit.id, organizationId),
+    ]);
+    
+    // Combine all related kit IDs
+    const relatedKitIds = [
+      kit.id,
+      ...ancestors.map(a => a.id),
+      ...descendants.map(d => d.id),
+    ];
+    
+    // Check for any conflicting bookings on related kits
+    const conflictCount = await db.booking.count({
+      where: {
+        id: currentBookingId ? { not: currentBookingId } : undefined,
+        organizationId,
+        status: { in: [BookingStatus.RESERVED, BookingStatus.ONGOING, BookingStatus.OVERDUE] },
+        assets: {
+          some: {
+            kitId: { in: relatedKitIds },
+          },
+        },
+        OR: [
+          { from: { lte: bookingTo }, to: { gte: bookingFrom } },
+          { from: { gte: bookingFrom }, to: { lte: bookingTo } },
+        ],
+      },
+    });
+    
+    // Only include kit if no conflicts found
+    if (conflictCount === 0) {
+      filteredKits.push(kit);
+    }
+  }
+  
+  return filteredKits;
 }
 
 type KitWithInclude<T extends Prisma.KitInclude | undefined> =
