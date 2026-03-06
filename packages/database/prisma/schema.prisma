@@ -1286,6 +1286,11 @@ model Kit {
   location   Location? @relation(fields: [locationId], references: [id])
   locationId String?
 
+  // Self-referential hierarchy (following Location pattern)
+  parentKitId String?
+  parentKit   Kit?  @relation("KitHierarchy", fields: [parentKitId], references: [id], onDelete: SetNull)
+  childKits   Kit[] @relation("KitHierarchy")
+
   // Indexes for foreign keys
   @@index([createdById])
   @@index([organizationId])
@@ -1293,6 +1298,8 @@ model Kit {
   @@index([categoryId, organizationId, createdAt]) //for time-based queries
   @@index([categoryId, organizationId, name]) //for name-based searches
   @@index([categoryId, organizationId, status]) //for status filtering
+  @@index([organizationId, parentKitId]) //for hierarchy queries
+  @@index([parentKitId]) //for child kit lookups
 }
 
 enum KitStatus {

@@ -6,6 +6,7 @@ BEGIN;
 
 -- Remove indexes added in migration
 DROP INDEX IF EXISTS "Kit_parentKitId_idx";
+DROP INDEX IF EXISTS "Kit_organizationId_parentKitId_idx";
 DROP INDEX IF EXISTS "Booking_organizationId_status_from_to_idx";
 DROP INDEX IF EXISTS "Asset_kitId_idx";
 
